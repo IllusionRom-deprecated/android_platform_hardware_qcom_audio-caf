@@ -1264,6 +1264,7 @@ static int out_standby(struct audio_stream *stream)
     pthread_mutex_lock(&out->lock);
     pthread_mutex_lock(&adev->lock);
     if (!out->standby) {
+        pthread_mutex_lock(&adev->lock);
         out->standby = true;
         if (out->usecase != USECASE_AUDIO_PLAYBACK_OFFLOAD) {
             if (out->pcm) {
@@ -1787,12 +1788,12 @@ static int in_standby(struct audio_stream *stream)
 
     pthread_mutex_lock(&in->lock);
     if (!in->standby) {
+        pthread_mutex_lock(&adev->lock);
         in->standby = true;
         if (in->pcm) {
             pcm_close(in->pcm);
             in->pcm = NULL;
         }
-        pthread_mutex_lock(&adev->lock);
         status = stop_input_stream(in);
         pthread_mutex_unlock(&adev->lock);
     }
