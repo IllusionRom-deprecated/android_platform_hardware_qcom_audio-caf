@@ -34,13 +34,14 @@
 #include "surround_filters_interface.h"
 
 #ifdef SSR_ENABLED
-#define COEFF_ARRAY_SIZE            4
-#define FILT_SIZE                   ((512+1)* 6)  /* # ((FFT bins)/2+1)*numOutputs */
-#define SSR_CHANNEL_INPUT_NUM       4
-#define SSR_CHANNEL_OUTPUT_NUM      6
-#define SSR_PERIOD_COUNT            8
-#define SSR_PERIOD_SIZE             512
-#define SSR_INPUT_FRAME_SIZE        (SSR_PERIOD_SIZE * SSR_PERIOD_COUNT)
+#define COEFF_ARRAY_SIZE      4
+#define FILT_SIZE             ((512+1)* 6)  /* # ((FFT bins)/2+1)*numOutputs */
+#define SSR_FRAME_SIZE        512
+#define SSR_INPUT_FRAME_SIZE  (SSR_FRAME_SIZE * 4)
+#define SSR_OUTPUT_FRAME_SIZE (SSR_FRAME_SIZE * 6)
+#define SSR_CHANNEL_COUNT     4
+#define SSR_PERIOD_SIZE       256
+#define SSR_PERIOD_COUNT      8
 
 #define SURROUND_FILE_1R "/system/etc/surround_sound/filter1r.pcm"
 #define SURROUND_FILE_2R "/system/etc/surround_sound/filter2r.pcm"
@@ -51,7 +52,7 @@
 #define SURROUND_FILE_2I "/system/etc/surround_sound/filter2i.pcm"
 #define SURROUND_FILE_3I "/system/etc/surround_sound/filter3i.pcm"
 #define SURROUND_FILE_4I "/system/etc/surround_sound/filter4i.pcm"
-
+#define AUDIO_PARAMETER_KEY_SSR "ssr"
 #define LIB_SURROUND_PROC       "libsurround_proc.so"
 
 typedef int  (*surround_filters_init_t)(void *, int, int, Word16 **,
@@ -66,7 +67,11 @@ struct ssr_module {
     int16_t             **real_coeffs;
     int16_t             **imag_coeffs;
     void                *surround_obj;
-    int16_t             *surround_raw_buffer;
+
+    int16_t             *surround_input_buffer;
+    int16_t             *surround_output_buffer;
+    int                 surround_input_bufferIdx;
+    int                 surround_output_bufferIdx;
     bool                is_ssr_enabled;
 
     void *surround_filters_handle;
@@ -76,13 +81,19 @@ struct ssr_module {
     surround_filters_intl_process_t surround_filters_intl_process;
 };
 
+static int32_t ssr_init_surround_sound_lib(unsigned long buffersize);
+static int32_t ssr_read_coeffs_from_file();
+
 static struct ssr_module ssrmod = {
     .fp_4ch = NULL,
-    .fp_6ch = NULL,
+    .fp_6ch= NULL,
     .real_coeffs = NULL,
     .imag_coeffs = NULL,
     .surround_obj = NULL,
-    .surround_raw_buffer = NULL,
+    .surround_output_buffer = NULL,
+    .surround_input_buffer = NULL,
+    .surround_output_bufferIdx = 0,
+    .surround_input_bufferIdx= 0,
     .is_ssr_enabled = 0,
 
     .surround_filters_handle = NULL,
@@ -219,17 +230,29 @@ static int32_t ssr_init_surround_sound_lib(unsigned long buffersize)
     int high_freq = 100;
     int i, ret = 0;
 
+    ssrmod.surround_input_bufferIdx = 0;
+    ssrmod.surround_output_bufferIdx = 0;
+
     if ( ssrmod.surround_obj ) {
         ALOGE("%s: ola filter library is already initialized", __func__);
         return 0;
     }
 
     /* Allocate memory for input buffer */
-    ssrmod.surround_raw_buffer = (Word16 *) calloc(buffersize,
+    ssrmod.surround_input_buffer = (Word16 *) calloc(2 * SSR_INPUT_FRAME_SIZE,
                                               sizeof(Word16));
-    if ( !ssrmod.surround_raw_buffer ) {
+    if ( !ssrmod.surround_input_buffer ) {
        ALOGE("%s: Memory allocation failure. Not able to allocate "
              "memory for surroundInputBuffer", __func__);
+       goto init_fail;
+    }
+
+    /* Allocate memory for output buffer */
+    ssrmod.surround_output_buffer = (Word16 *) calloc(2 * SSR_OUTPUT_FRAME_SIZE,
+                                               sizeof(Word16));
+    if ( !ssrmod.surround_output_buffer ) {
+       ALOGE("%s: Memory allocation failure. Not able to "
+             "allocate memory for surroundOutputBuffer", __func__);
        goto init_fail;
     }
 
@@ -330,9 +353,13 @@ init_fail:
         free(ssrmod.surround_obj);
         ssrmod.surround_obj = NULL;
     }
-    if (ssrmod.surround_raw_buffer) {
-        free(ssrmod.surround_raw_buffer);
-        ssrmod.surround_raw_buffer = NULL;
+    if (ssrmod.surround_output_buffer) {
+        free(ssrmod.surround_output_buffer);
+        ssrmod.surround_output_buffer = NULL;
+    }
+    if (ssrmod.surround_input_buffer) {
+        free(ssrmod.surround_input_buffer);
+        ssrmod.surround_input_buffer = NULL;
     }
     if (ssrmod.real_coeffs){
         for (i =0; i<COEFF_ARRAY_SIZE; i++ ) {
@@ -358,7 +385,7 @@ init_fail:
     return -ENOMEM;
 }
 
-void audio_extn_ssr_update_enabled()
+int32_t audio_extn_ssr_update_enabled(struct audio_device *adev)
 {
     char ssr_enabled[PROPERTY_VALUE_MAX] = "false";
 
@@ -370,6 +397,7 @@ void audio_extn_ssr_update_enabled()
         ALOGD("%s: surround sound recording is not supported", __func__);
         ssrmod.is_ssr_enabled = false;
     }
+    return 0;
 }
 
 bool audio_extn_ssr_get_enabled()
@@ -386,13 +414,12 @@ int32_t audio_extn_ssr_init(struct audio_device *adev,
     uint32_t buffer_size;
 
     ALOGD("%s: ssr case ", __func__);
-    in->config.channels = SSR_CHANNEL_INPUT_NUM;
+    in->config.channels = SSR_CHANNEL_COUNT;
     in->config.period_size = SSR_PERIOD_SIZE;
     in->config.period_count = SSR_PERIOD_COUNT;
 
-    /* use 4k hardcoded buffer size for ssr*/
-    buffer_size = SSR_INPUT_FRAME_SIZE;
-    ALOGV("%s: buffer_size: %d", __func__, buffer_size);
+    buffer_size = (SSR_PERIOD_SIZE)*(SSR_PERIOD_COUNT);
+    ALOGD("%s: buffer_size: %d", __func__, buffer_size);
 
     ret = ssr_init_surround_sound_lib(buffer_size);
     if (0 != ret) {
@@ -402,16 +429,16 @@ int32_t audio_extn_ssr_init(struct audio_device *adev,
     }
 
     property_get("ssr.pcmdump",c_multi_ch_dump,"0");
-    if (0 == strncmp("true", c_multi_ch_dump, sizeof("ssr.dump-pcm"))) {
-        /* Remember to change file system permission of data(e.g. chmod 777 data/),
-          otherwise, fopen may fail */
-        if ( !ssrmod.fp_4ch)
-            ssrmod.fp_4ch = fopen("/data/4ch.pcm", "wb");
-        if ( !ssrmod.fp_6ch)
-            ssrmod.fp_6ch = fopen("/data/6ch.pcm", "wb");
-        if ((!ssrmod.fp_4ch) || (!ssrmod.fp_6ch))
-            ALOGE("%s: mfp_4ch or mfp_6ch open failed: mfp_4ch:%p mfp_6ch:%p",
-                  __func__, ssrmod.fp_4ch, ssrmod.fp_6ch);
+    if (0 == strncmp("true",c_multi_ch_dump, sizeof("ssr.dump-pcm"))) {
+    /* Remember to change file system permission of data(e.g. chmod 777 data/),
+      otherwise, fopen may fail */
+    if ( !ssrmod.fp_4ch)
+    ssrmod.fp_4ch = fopen("/data/media/0/4ch_ssr.pcm", "wb");
+    if ( !ssrmod.fp_6ch)
+    ssrmod.fp_6ch = fopen("/data/media/0/6ch_ssr.pcm", "wb");
+    if ((!ssrmod.fp_4ch) || (!ssrmod.fp_6ch))
+        ALOGE("%s: mfp_4ch or mfp_6ch open failed: mfp_4ch:%p mfp_6ch:%p",
+              __func__, ssrmod.fp_4ch, ssrmod.fp_6ch);
     }
 
     return 0;
@@ -422,7 +449,7 @@ int32_t audio_extn_ssr_deinit()
     int i;
 
     if (ssrmod.surround_obj) {
-        ALOGV("%s: entry", __func__);
+        ALOGD("%s: entry", __func__);
         ssrmod.surround_filters_release(ssrmod.surround_obj);
         if (ssrmod.surround_obj)
             free(ssrmod.surround_obj);
@@ -447,21 +474,25 @@ int32_t audio_extn_ssr_deinit()
             free(ssrmod.imag_coeffs);
             ssrmod.imag_coeffs = NULL;
         }
-        if (ssrmod.surround_raw_buffer) {
-            free(ssrmod.surround_raw_buffer);
-            ssrmod.surround_raw_buffer = NULL;
+        if (ssrmod.surround_output_buffer){
+            free(ssrmod.surround_output_buffer);
+            ssrmod.surround_output_buffer = NULL;
         }
-        if (ssrmod.fp_4ch)
-            fclose(ssrmod.fp_4ch);
-        if (ssrmod.fp_6ch)
-            fclose(ssrmod.fp_6ch);
+        if (ssrmod.surround_input_buffer) {
+            free(ssrmod.surround_input_buffer);
+            ssrmod.surround_input_buffer = NULL;
+        }
+
+        if ( ssrmod.fp_4ch ) fclose(ssrmod.fp_4ch);
+        if ( ssrmod.fp_6ch ) fclose(ssrmod.fp_6ch);
     }
 
-    if(ssrmod.surround_filters_handle) {
+    if(ssrmod.surround_filters_handle)
+    {
         dlclose(ssrmod.surround_filters_handle);
         ssrmod.surround_filters_handle = NULL;
     }
-    ALOGV("%s: exit", __func__);
+    ALOGD("%s: exit", __func__);
 
     return 0;
 }
@@ -469,36 +500,120 @@ int32_t audio_extn_ssr_deinit()
 int32_t audio_extn_ssr_read(struct audio_stream_in *stream,
                        void *buffer, size_t bytes)
 {
+    int processed = 0;
+    int processed_pending;
+    void *buffer_start = buffer;
+    unsigned period_bytes;
+    unsigned period_samples;
+    int read_pending, n;
+    size_t read_bytes = 0;
+    int samples = bytes >> 1;
+
     struct stream_in *in = (struct stream_in *)stream;
     struct audio_device *adev = in->dev;
-    size_t peroid_bytes;
-    int32_t ret;
 
-    /* Convert bytes for 6ch to 4ch*/
-    peroid_bytes = (bytes / SSR_CHANNEL_OUTPUT_NUM) * SSR_CHANNEL_INPUT_NUM;
+    period_bytes = in->config.period_size;
+    ALOGD("%s: period_size: %d", __func__, in->config.period_size);
+    period_samples = period_bytes >> 1;
 
-    if (!ssrmod.surround_obj) {
-        ALOGE("%s: surround_obj not initialized", __func__);
+    if (!ssrmod.surround_obj)
         return -ENOMEM;
-    }
 
-    ret = pcm_read(in->pcm, ssrmod.surround_raw_buffer, peroid_bytes);
-    if (ret < 0) {
-        ALOGE("%s: %s ret:%d", __func__, pcm_get_error(in->pcm),ret);
-        return ret;
-    }
+    do {
+            if (ssrmod.surround_output_bufferIdx > 0) {
+                ALOGV("%s: copy processed output "
+                     "to buffer, surround_output_bufferIdx = %d",
+                     __func__, ssrmod.surround_output_bufferIdx);
+                /* Copy processed output to buffer */
+                processed_pending = ssrmod.surround_output_bufferIdx;
+                if (processed_pending > (samples - processed)) {
+                    processed_pending = (samples - processed);
+                }
+                memcpy(buffer, ssrmod.surround_output_buffer, processed_pending * sizeof(Word16));
+                buffer = (char*)buffer + processed_pending * sizeof(Word16);
+                processed += processed_pending;
+                if (ssrmod.surround_output_bufferIdx > processed_pending) {
+                    /* Shift leftover samples to beginning of the buffer */
+                    memcpy(&ssrmod.surround_output_buffer[0],
+                           &ssrmod.surround_output_buffer[processed_pending],
+                           (ssrmod.surround_output_bufferIdx - processed_pending) * sizeof(Word16));
+                }
+                ssrmod.surround_output_bufferIdx -= processed_pending;
+            }
 
-    /* apply ssr libs to conver 4ch to 6ch */
-    ssrmod.surround_filters_intl_process(ssrmod.surround_obj,
-        buffer, ssrmod.surround_raw_buffer);
+            if (processed >= samples) {
+                ALOGV("%s: done processing buffer, "
+                     "processed = %d", __func__, processed);
+                /* Done processing this buffer */
+                break;
+            }
 
-    /*dump for raw pcm data*/
-    if (ssrmod.fp_4ch)
-        fwrite(ssrmod.surround_raw_buffer, 1, peroid_bytes, ssrmod.fp_4ch);
-    if (ssrmod.fp_6ch)
-        fwrite(buffer, 1, bytes, ssrmod.fp_6ch);
+            /* Fill input buffer until there is enough to process */
+            read_pending = SSR_INPUT_FRAME_SIZE - ssrmod.surround_input_bufferIdx;
+            read_bytes = ssrmod.surround_input_bufferIdx;
+            while (in->pcm && read_pending > 0) {
+                n = pcm_read(in->pcm, &ssrmod.surround_input_buffer[read_bytes],
+                             period_bytes);
+                ALOGV("%s: pcm_read() returned n = %d buffer:%p size:%d", __func__,
+                    n, &ssrmod.surround_input_buffer[read_bytes], period_bytes);
+                if (n && n != -EAGAIN) {
+                    /* Recovery part of pcm_read. TODO:split recovery */
+                    return (ssize_t)n;
+                }
+                else if (n < 0) {
+                    /* Recovery is part of pcm_write. TODO split is later */
+                    return (ssize_t)n;
+                }
+                else {
+                    read_pending -= period_samples;
+                    read_bytes += period_samples;
+                }
+            }
 
-    return ret;
+
+            if (ssrmod.fp_4ch) {
+                fwrite( ssrmod.surround_input_buffer, 1,
+                        SSR_INPUT_FRAME_SIZE * sizeof(Word16), ssrmod.fp_4ch);
+            }
+
+            /* apply ssr libs to conver 4ch to 6ch */
+            ssrmod.surround_filters_intl_process(ssrmod.surround_obj,
+                &ssrmod.surround_output_buffer[ssrmod.surround_output_bufferIdx],
+                (Word16 *)ssrmod.surround_input_buffer);
+
+            /* Shift leftover samples to beginning of input buffer */
+            if (read_pending < 0) {
+                memcpy(&ssrmod.surround_input_buffer[0],
+                       &ssrmod.surround_input_buffer[SSR_INPUT_FRAME_SIZE],
+                       (-read_pending) * sizeof(Word16));
+            }
+            ssrmod.surround_input_bufferIdx = -read_pending;
+
+            if (ssrmod.fp_6ch) {
+                fwrite( &ssrmod.surround_output_buffer[ssrmod.surround_output_bufferIdx],
+                        1, SSR_OUTPUT_FRAME_SIZE * sizeof(Word16), ssrmod.fp_6ch);
+            }
+
+            ssrmod.surround_output_bufferIdx += SSR_OUTPUT_FRAME_SIZE;
+            ALOGV("%s: do_while loop: processed=%d, samples=%d\n", __func__, processed, samples);
+        } while (in->pcm && processed < samples);
+        read_bytes = processed * sizeof(Word16);
+        buffer = buffer_start;
+
+    return 0;
 }
 
+void audio_extn_ssr_get_parameters(struct str_parms *query,
+                                   struct str_parms *reply)
+{
+    int ret, val;
+    char value[32]={0};
+
+    ret = str_parms_get_str(query, AUDIO_PARAMETER_KEY_SSR, value, sizeof(value));
+
+    if (ret >= 0) {
+        memcpy(value, "true", 4);
+        str_parms_add_str(reply, AUDIO_PARAMETER_KEY_SSR, value);
+    }
+}
 #endif /* SSR_ENABLED */
