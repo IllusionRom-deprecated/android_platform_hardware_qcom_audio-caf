@@ -70,13 +70,6 @@ enum {
     INCALL_REC_UPLINK_AND_DOWNLINK,
 };
 
-enum {
-    INCALL_REC_NONE = -1,
-    INCALL_REC_UPLINK,
-    INCALL_REC_DOWNLINK,
-    INCALL_REC_UPLINK_AND_DOWNLINK,
-};
-
 int voice_start_call(struct audio_device *adev);
 int voice_stop_call(struct audio_device *adev);
 int voice_set_parameters(struct audio_device *adev, struct str_parms *parms);
