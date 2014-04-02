@@ -6,6 +6,7 @@ ifeq ($(strip $(BOARD_USES_ALSA_AUDIO)),true)
     include $(AUDIO_HW_ROOT)/mm-audio/Android.mk
     include $(AUDIO_HW_ROOT)/audiod/Android.mk
     include $(AUDIO_HW_ROOT)/visualizer/Android.mk
+    include $(AUDIO_HW_ROOT)/voice_processing/Android.mk
 endif
 
 ifeq ($(TARGET_BOARD_PLATFORM),msm7x30)
