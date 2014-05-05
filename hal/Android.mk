@@ -122,6 +122,13 @@ ifneq ($(strip $(AUDIO_FEATURE_DISABLED_DS1_DOLBY_DDP)),true)
     LOCAL_SRC_FILES += audio_extn/dolby.c
 endif
 endif
+
+ifneq ($(filter msm8974 msm8226,$(TARGET_BOARD_PLATFORM)),)
+ifeq ($(strip $(AUDIO_FEATURE_SEPARATE_SPKR_BACKEND)),true)
+    LOCAL_CFLAGS += -DSEPARATE_SPKR_BACKEND
+endif
+endif
+
 LOCAL_SHARED_LIBRARIES := \
 	liblog \
 	libcutils \
